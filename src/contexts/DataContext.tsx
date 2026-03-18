@@ -114,7 +114,169 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       console.error('Error creating task:', error);
       return;
     }
+
+    // Fire integrations after successful creation
+    const createdTask = data as Task;
+    sendHubSpotTask(createdTask);
+    sendSlackDMNotification(createdTask);
+
     return data.id;
+  };
+
+  // HubSpot: create task + associate to contact
+  const sendHubSpotTask = async (task: Task) => {
+    if (!userProfile?.hubspot_enabled || !userProfile?.hubspot_token) return;
+
+    try {
+      const dueDate = task.due_date ? new Date(task.due_date).getTime() : Date.now() + 7 * 24 * 60 * 60 * 1000;
+      const priorityMap: Record<string, string> = { high: 'HIGH', medium: 'MEDIUM', low: 'LOW' };
+      const assignee = users.find(u => u.id === task.assignee_id);
+
+      // Create HubSpot task
+      const taskRes = await fetch(
+        `https://corsproxy.io/?${encodeURIComponent('https://api.hubapi.com/crm/v3/objects/tasks')}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${userProfile.hubspot_token}`,
+          },
+          body: JSON.stringify({
+            properties: {
+              hs_task_subject: task.title,
+              hs_task_body: task.description || '',
+              hs_task_status: 'NOT_STARTED',
+              hs_task_priority: priorityMap[task.urgency] || 'MEDIUM',
+              hs_timestamp: dueDate.toString(),
+            },
+          }),
+        }
+      );
+
+      if (!taskRes.ok) {
+        console.error('HubSpot task creation failed:', await taskRes.text());
+        return;
+      }
+
+      const hubspotTask = await taskRes.json();
+      console.log('HubSpot task created:', hubspotTask.id);
+
+      // If assignee has email, search for HubSpot contact and associate
+      if (assignee?.email) {
+        const searchRes = await fetch(
+          `https://corsproxy.io/?${encodeURIComponent('https://api.hubapi.com/crm/v3/objects/contacts/search')}`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${userProfile.hubspot_token}`,
+            },
+            body: JSON.stringify({
+              filterGroups: [{
+                filters: [{
+                  propertyName: 'email',
+                  operator: 'EQ',
+                  value: assignee.email,
+                }],
+              }],
+            }),
+          }
+        );
+
+        const searchData = await searchRes.json();
+        if (searchData.total > 0) {
+          const contactId = searchData.results[0].id;
+          // Associate task to contact (type 204)
+          await fetch(
+            `https://corsproxy.io/?${encodeURIComponent(`https://api.hubapi.com/crm/v3/objects/tasks/${hubspotTask.id}/associations/contacts/${contactId}/204`)}`,
+            {
+              method: 'PUT',
+              headers: { 'Authorization': `Bearer ${userProfile.hubspot_token}` },
+            }
+          );
+          console.log('HubSpot task associated with contact:', contactId);
+        }
+      }
+    } catch (err) {
+      console.error('HubSpot integration error:', err);
+    }
+  };
+
+  // Slack: DM the assignee when a task is created
+  const sendSlackDMNotification = async (task: Task) => {
+    if (!userProfile?.slack_enabled || !userProfile?.slack_token) return;
+    if (!task.assignee_id) return;
+
+    const assignee = users.find(u => u.id === task.assignee_id);
+    if (!assignee?.email) return;
+
+    try {
+      // Look up Slack user by email
+      const lookupRes = await fetch(
+        `https://corsproxy.io/?${encodeURIComponent(`https://slack.com/api/users.lookupByEmail?email=${encodeURIComponent(assignee.email)}`)}`,
+        {
+          headers: { 'Authorization': `Bearer ${userProfile.slack_token}` },
+        }
+      );
+      const lookupData = await lookupRes.json();
+      if (!lookupData.ok) {
+        console.warn('Slack user not found for:', assignee.email);
+        return;
+      }
+
+      const slackUserId = lookupData.user.id;
+
+      // Open DM conversation
+      const dmRes = await fetch(
+        `https://corsproxy.io/?${encodeURIComponent('https://slack.com/api/conversations.open')}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${userProfile.slack_token}`,
+          },
+          body: JSON.stringify({ users: slackUserId }),
+        }
+      );
+      const dmData = await dmRes.json();
+      if (!dmData.ok) return;
+
+      const channelId = dmData.channel.id;
+      const priority = (task.urgency || 'medium').charAt(0).toUpperCase() + (task.urgency || 'medium').slice(1);
+      const dueDate = task.due_date ? format(new Date(task.due_date), 'MMM d, yyyy') : 'No due date';
+      const creatorName = userProfile.display_name || currentUser?.email || 'Someone';
+
+      // Send DM with Block Kit
+      const blocks = [
+        { type: "header", text: { type: "plain_text", text: "📋 New Task Assigned", emoji: true } },
+        { type: "section", text: { type: "mrkdwn", text: `*${task.title}*` } },
+        {
+          type: "section",
+          fields: [
+            { type: "mrkdwn", text: `*Assigned by:*\n${creatorName}` },
+            { type: "mrkdwn", text: `*Priority:*\n${priority}` },
+            { type: "mrkdwn", text: `*Due:*\n${dueDate}` },
+            { type: "mrkdwn", text: `*Status:*\nTo Do` },
+          ],
+        },
+        { type: "divider" },
+      ];
+
+      await fetch(
+        `https://corsproxy.io/?${encodeURIComponent('https://slack.com/api/chat.postMessage')}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${userProfile.slack_token}`,
+          },
+          body: JSON.stringify({ channel: channelId, blocks }),
+        }
+      );
+      console.log('Slack DM sent to:', assignee.email);
+    } catch (err) {
+      console.error('Slack DM error:', err);
+    }
   };
 
   const updateTask = async (id: string, updates: Partial<Task>) => {
